@@ -1,0 +1,300 @@
+---
+title: "Numerai XGBoost starter with t-sne features and random search parameter tuning"
+author: "johnbutter"
+date: "March 8, 2017"
+output: html_document
+---
+
+#Introduction
+The following document can be used to tune-in XGBoost hyper-parameters. It is designed to experiment with different combinations of features, parameters and compare results.
+
+##Analysis info
+The following information show brief overview of what was done:
+
+- Load Training File
+- Structure
+- Correlations
+- Remove highly correlated features
+
+
+##Read CSV files
+Open the Files and read with `readr` package which is fast.
+```{r message=FALSE, echo=FALSE}
+library(data.table)
+library(Matrix)
+library(mlr)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(RColorBrewer)
+library(Rtsne)
+library(e1071)
+require(xgboost)
+require(dplyr)
+require(lubridate)
+
+train.raw <- read_csv('~/Desktop/Data/Numerai/numerai_datasets-6/train.csv')
+test.raw <- read_csv('~/Desktop/Data/Numerai/numerai_datasets-6/test.csv')
+
+# Structure
+str(train.raw)
+str(test.raw)
+```
+
+Let's visualize the correlations on the base set of features with significance.
+
+```{r message=FALSE}
+# Correlations on train.raw
+# significance test for correlations
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+# Get all correlations
+M<-cor(train.raw)
+
+# Obtain significance on remaining high correlations
+p.mat <- cor.mtest(M)
+
+# Visualize
+corrplot(M, type="upper", order="hclust", col=brewer.pal(n=8, name="RdBu"),
+         p.mat = p.mat, sig.level = 0.01, insig = "blank")
+```
+
+You should apply any imputation and feature extraction methods
+
+```{r, message=FALSE, echo=FALSE}
+# Retain target and t_id and balance files for appending
+keep.t_id<-test.raw$t_id
+keep.target<-train.raw$target
+test.raw$t_id<-NULL
+test.raw$target<-NaN
+
+# Build full set first combining both train and test
+feature.full<-rbind(train.raw, test.raw)
+
+# add features to end of full
+keep.feature.target<-feature.full$target
+feature.full$target<-NULL
+feature.full$r1_8<-feature.full$feature1/(feature.full$feature8+0.000001)
+feature.full$r5_6<-feature.full$feature5/(feature.full$feature6+0.000001)
+feature.full$r8_13<-feature.full$feature8/(feature.full$feature13+0.000001)
+feature.full$r12_17<-feature.full$feature12/(feature.full$feature17+0.000001)
+```
+
+Let's experiment with dimension reduction using T-SNE
+
+```{r, message=FALSE}
+# t-sne dimension reduction for additional features
+# shrink the size to see it working, takes about 180min on 500k rows
+
+set.seed(1969) # for reproducibility
+tsne <- Rtsne(feature.full, dims = 2, perplexity=30, verbose=TRUE, max_iter = 500)
+
+# add t-sne and target column features to feature.full
+feature.full <- cbind(feature.full, "sne1"=tsne$Y[,1]) 
+feature.full <- cbind(feature.full, "sne2"=tsne$Y[,2])
+feature.full <- cbind(feature.full, "target"=keep.feature.target)
+
+# split train and test with new features for CV tuning
+train.full<-as.data.frame(feature.full[1:nrow(train.raw),])
+test.full<-as.data.frame(feature.full[(nrow(train.raw)+1):nrow(feature.full),])
+
+# Drop unnecessary columns from test
+test.full$target <- NULL
+```
+
+# Visualize t-sne results if you would like
+
+```{r, message=FALSE, echo=FALSE}
+# visualizing t-sne
+colors = rainbow(length(unique(feature.full$target)))
+names(colors) = unique(feature.full$target)
+plot(tsne$Y, t='n', main="tsne")
+text(tsne$Y, labels=feature.full$target, col=colors[feature.full$target])
+```
+
+##Prepare the data
+Before proceeding the data frame will be stored as a *sparse matrix*. The TARGET column will be treated as a target variable and therefore removed from the matrix:
+
+Data will be stored using `DGMatrix` class, which is a recommended way
+```{r, message=FALSE, echo= FALSE}
+require(Matrix)
+train.full.sparse <- sparse.model.matrix(target~.-1, data=train.full)
+rm(dtrain)
+dtrain <- xgb.DMatrix(
+  data=train.full.sparse, 
+  label=train.full$target,
+  missing = NaN)
+```
+
+##Evaluation metric
+The evaluation metric is unique for each competition and business problem.  This example is a custom metric (root mean square percentage error) that you may be able to modify for different problems. XGBoost has standard metrics in the package and it allows us to specify custom metric for validating the results:
+```{r, message= FALSE}
+rmpse <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  elab <- exp(as.numeric(labels))
+  epreds <- exp(as.numeric(preds))
+  err <- sqrt(mean((epreds/elab-1)^2))
+  return(list(metric = "RMPSE", value = err))
+}
+```
+
+##Initialize Parameters
+In this part we initialize the parameters that can be tuned to improve error experience of your custom error.
+
+##Training
+Training is done using 5-fold CV, which is a common place to begin with cross validation. If your TEST set is a % of your TRAINING, you may want to consider replicating that split with your TRAINING only.  That way you have the actual results when you predict on TEST and can see where your algorithms are underperforming or overfitting.  
+
+```{r, message= FALSE}
+
+################# Loop 5x initially to see where the values converge, then 50
+# Automated to run and may take a long time.
+#####################
+nloops<-5 # Set this for the number of random loops
+best_param = list() # You will store your best set of parameters here
+best_seednumber = 1969 # Initialize to same number for starters
+best_error = Inf # Set to infinity for starters
+best_error_index = 0
+best_history<-NULL
+cv.nround = 200 # Set to number of rounds you'd like it to fit - usually higher
+cv.nfold = 5 # 5-Fold Validation
+cv.earlystop = 5 # Stop after consecutive rounds of no improvement
+
+for (iter in 1:nloops) {
+  param <- list(objective = "reg:logistic", # Objective for the algorithm
+                booster="gbtree", # Make sure this aligns to your objective
+                eval_metric="logloss",
+                max_depth = sample(1:5, 1), # Range 8-11 common 8
+                eta = runif(1, .1, .3), # Range .1-.3, common 0.8
+                gamma = runif(1, 0.0, 0.2), # Range 0-.2
+                subsample = runif(1, .6, .9), # Range 0.6-0.9 common 0.7
+                colsample_bytree = runif(1, .5, .8), # Range .5-.8 common 0.7
+                min_child_weight = sample(1:40, 1), # Range 1-40
+                max_delta_step = sample(1:10, 1) # Range 1-10
+  )
+  seed.number = sample.int(10000, 1)[[1]]
+  set.seed(seed.number)
+  history <- xgb.cv(data=dtrain, 
+                 params = param, 
+                 #watchlist = watchlist, 
+                 nfold=cv.nfold, 
+                 nrounds=cv.nround,
+                 verbose = F, # Change to T if you'd like to see it learn
+                 early.stop.round=cv.earlystop, 
+                 #feval=rmpse, # custom evaluation metric function call
+                 maximize=FALSE)
+  huh<-as.data.frame(history$test.logloss.mean)
+  m_error = min(huh) # Make sure you change this if using a different function or err name
+  m_error_index = which(huh==min(huh)) # Sets the number of rounds
+  
+  if (m_error < best_error) {
+    best_error = m_error
+    best_error_index = m_error_index
+    best_seednumber = seed.number
+    best_param = param
+    best_history = history
+  }
+  cat("Loop:", iter,"  Error:",m_error,"\n"); # Shows which random iteration you are on
+}
+
+nround = best_error_index
+set.seed(best_seednumber)
+cat("Best round:", best_error_index,"\n");
+cat("Best result:",best_error,"\n");
+write.csv(data.frame(best_param), "~/Desktop/Data/Numerai/numerai_datasets-6/XGBPARAM.csv", row.names = F)
+############################################
+# END XGBoost Tuning
+############################################
+```
+
+## Hyperparameter tuning results
+The best score obtained: **`r m_error`**
+The process of training the data is visualized on the following plot:
+
+```{r, message=FALSE, echo= FALSE}
+require(ggplot2)
+
+best_history$trees <- as.integer(rownames(best_history))
+
+ggplot(best_history, aes(x=trees, y=test.logloss.mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin=test.logloss.mean-test.logloss.std, ymax=test.logloss.mean+test.logloss.std), 
+    width=.05, 
+    color="red") +
+  ggtitle("Training ERROR using 5-fold CV") + xlab("Number of trees") + ylab("ERROR") +
+  annotate("text", 
+           x=max(best_history$trees), 
+           y=max(best_history$test.logloss.mean)-0.1, 
+           label=paste("Best ERROR:\n", min(best_history$test.logloss.mean)), 
+           alpha=.5, 
+           hjust=1) +
+  theme_bw()
+```
+
+## Train XGBoost
+
+```{r, message= FALSE, echo = FALSE}
+######################################
+# Train XGB Model
+######################################
+rm(dtrain)
+dtrain <- xgb.DMatrix(
+  data=train.full.sparse, 
+  label=keep.target,
+  missing = NaN)
+
+clf <- xgb.train(   params              = best_param, 
+                    data                = dtrain, 
+                    nrounds             = best_error_index, 
+                    verbose             = T,
+                    maximize            = FALSE
+)
+```
+
+Visualize Variable Importance
+
+```{r, message= FALSE, echo = FALSE}
+##########################
+# Visualize Variable Importance
+##########################
+importance <- xgb.importance(feature_names = colnames(train.full), model = clf)
+xgb.plot.importance(importance)
+```
+
+
+```{r, message= FALSE, echo=FALSE}
+##########################
+# Begin Predictions on Tournament Data
+##########################
+
+# Make XGB Predictions
+pred.xgb <- rep(0,nrow(test.full))
+testM <-data.matrix(test.full, rownames.force = NA)
+pred.xgb <- round(predict(clf, testM),10)
+####### THIS IS XGBOOST BASE PREDICTION SET ######################
+numeraipred <- data.frame(id=keep.t_id, xgbp=pred.xgb)
+#############################################################
+```
+
+## Generating a Submission Files
+
+```{r, message=FALSE}
+# Write out submission files
+# You can experiment with different ensembles here too.
+setkey(as.data.table(numeraipred), "id")
+write.csv(data.frame("t_id"=numeraipred$id, "probability"=numeraipred$xgbp), "~/Desktop/Data/Numerai/numerai_datasets-6/baseXGB.csv", row.names = F)
+```
